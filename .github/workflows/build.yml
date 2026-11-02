@@ -1,0 +1,68 @@
+name: Build (unsigned)
+
+# Compiles the app on every push / PR and uploads an unsigned .ipa that can be
+# sideloaded (e.g. with Sideloadly or AltStore) or re-signed later.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile & package
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      SCHEME: TimetableStudio
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          if [ -n "${XCODE_VERSION:-}" ] && [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          fi
+          xcodebuild -version
+        env:
+          XCODE_VERSION: ${{ vars.XCODE_VERSION }}
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build for iOS device (no signing)
+        run: |
+          xcodebuild \
+            -project "$SCHEME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -quiet \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          echo "App bundle: $APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry "../$SCHEME-unsigned.ipa" Payload)
+          ls -lh "$SCHEME-unsigned.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SCHEME }}-unsigned-ipa
+          path: ${{ env.SCHEME }}-unsigned.ipa
+          retention-days: 14
