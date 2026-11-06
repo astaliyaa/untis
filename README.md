@@ -47,83 +47,43 @@ The app runs on iOS 17 and later.
 | Workflow | Trigger | Output |
 |---|---|---|
 | `Build (unsigned)` (`build.yml`) | every push / PR | `TimetableStudio-unsigned-ipa` artifact. Proves it compiles; can be sideloaded with Sideloadly/AltStore |
-| `Release (signed)` (`release.yml`) | **Actions → Release (signed) → Run workflow**, or pushing a tag `v*` | signed `.ipa` artifact + optional TestFlight upload |
+| `Release (TestFlight)` (`release.yml`) | **Actions → Release (TestFlight) → Run workflow**, or pushing a tag `v*` | build uploaded to TestFlight + App Store-signed `.ipa` artifact |
 
-> The *Run workflow* button only shows up once `release.yml` is on the repository's default
-> branch, so merge this branch first.
+### Secrets
 
-### Secrets for the signed build
+The release only needs an App Store Connect API key. It doesn't need certificate or
+provisioning-profile files, and you don't need a Mac. The archive is built unsigned and
+ad-hoc signed (`scripts/adhoc_sign_archive.sh`). `xcodebuild -exportArchive` then signs
+it with a cloud-managed Apple Distribution certificate from your account and uploads it.
 
-Add these in **GitHub → Settings → Secrets and variables → Actions → New repository secret**.
-
-| Secret | What it is |
+| Repository secret | What it is |
 |---|---|
-| `BUILD_CERTIFICATE_BASE64` | Your **Apple Distribution** certificate *with private key* as `.p12`, base64 encoded |
-| `P12_PASSWORD` | Password you set when exporting the `.p12` |
-| `BUILD_PROVISION_PROFILE_BASE64` | The provisioning profile (`.mobileprovision`), base64 encoded |
-| `KEYCHAIN_PASSWORD` | *(optional)* any random string |
-| `ASC_KEY_ID` | *(TestFlight)* App Store Connect API key ID |
-| `ASC_ISSUER_ID` | *(TestFlight)* Issuer ID shown above the key list |
-| `ASC_KEY_P8` | *(TestFlight)* contents of `AuthKey_XXXXXX.p8` (paste as-is or base64) |
+| `APPLE_TEAM_ID` | 10-character Team ID: [developer.apple.com/account](https://developer.apple.com/account) → Membership details |
+| `ASC_KEY_ID` | Key ID of an App Store Connect API key |
+| `ASC_ISSUER_ID` | Issuer ID, shown above the key list |
+| `ASC_KEY_P8` | Contents of `AuthKey_<KEY_ID>.p8`: paste the whole file, including the `BEGIN`/`END` lines (base64 also works) |
+| `MATCH_PASSWORD` | Not used. Only needed for fastlane match, which also requires a private certificates repo and access token. Cloud signing replaces it |
 
-Optional **variables** (same page, *Variables* tab): `BUNDLE_ID` (only needed for a
-wildcard profile) and `XCODE_VERSION` (e.g. `26.6`) to pin Xcode.
+Optional repository **variables** (*Variables* tab): `BUNDLE_ID` (default
+`com.<repo owner>.timetablestudio`) and `XCODE_VERSION` (e.g. `26.6`) to pin Xcode.
 
-The workflow reads the bundle ID, team ID and profile type straight from the
-provisioning profile. An *App Store* profile → TestFlight upload; *Ad Hoc* or
-*Development* profile → installable `.ipa` for the devices in that profile.
+**One-time setup in App Store Connect**
 
-#### 1. App ID (bundle identifier)
-[developer.apple.com/account/resources/identifiers](https://developer.apple.com/account/resources/identifiers/list)
-→ **+** → App IDs → App → e.g. `com.yourname.timetablestudio`. No capabilities needed.
+1. **API key with the Admin role.** Users and Access → Integrations → App Store Connect API →
+   *Team Keys* → **+** → Access: **Admin**. Only Admin keys may use cloud-managed
+   distribution certificates; with any other role, signing fails with a permission error.
+2. **The app record.** The first workflow run registers the App ID (bundle ID) for you. If no
+   App Store Connect app exists yet, the run stops with the exact bundle ID to use. Then go to
+   Apps → **+** → *New App* → iOS, any free name, that bundle ID, any SKU, and run the
+   workflow again. Nothing is submitted for review; TestFlight internal testing needs no
+   review.
 
-#### 2. Distribution certificate (`.p12`)
-On a **Mac**: Keychain Access → *Certificate Assistant → Request a Certificate From a
-Certificate Authority* → save to disk. In the portal under Certificates → **+** →
-*Apple Distribution*, upload the request and download the `.cer`. Double-click it, then
-in Keychain Access → *My Certificates* right-click it → *Export…* → `.p12` with a password.
+Each run uses `run_number.run_attempt` as the build number, so re-runs never collide.
+After the upload, the build appears under *TestFlight* in App Store Connect within about
+5–15 minutes. Add yourself as an internal tester and install it with the TestFlight app.
 
-**Without a Mac** (Windows Git Bash, Linux, WSL):
-
-```bash
-openssl genrsa -out dist.key 2048
-openssl req -new -key dist.key -out dist.csr -subj "/emailAddress=you@example.com/CN=Your Name/C=DE"
-# upload dist.csr in the portal (Apple Distribution) and download distribution.cer, then:
-openssl x509 -inform DER -in distribution.cer -out dist.pem
-openssl pkcs12 -export -legacy -inkey dist.key -in dist.pem -out dist.p12 -passout pass:CHOOSE_A_PASSWORD
-```
-
-If your OpenSSL doesn't know `-legacy`, use
-`-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1` instead. macOS's keychain
-can't import the newer default p12 encryption.
-
-#### 3. Provisioning profile
-Profiles → **+** → *App Store Connect* (for TestFlight) or *Ad Hoc* (to install
-directly on registered devices) → choose the App ID and the certificate → download.
-
-#### 4. App record + API key (TestFlight only)
-* [App Store Connect](https://appstoreconnect.apple.com) → Apps → **+ New App**, using the
-  same bundle ID. The name can be anything that's free, and nothing gets submitted for review.
-* Users and Access → **Integrations → App Store Connect API** → Team Keys → **+**
-  (role *App Manager* or *Admin*). Note the **Key ID** and **Issuer ID** and download the
-  `.p8` file. You can only download it once.
-
-#### 5. Base64-encode the files
-
-```bash
-# macOS
-base64 -i dist.p12 | pbcopy
-base64 -i profile.mobileprovision | pbcopy
-# Linux / Git Bash
-base64 -w0 dist.p12
-# Windows PowerShell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("dist.p12")) | Set-Clipboard
-```
-
-Then run **Actions → Release (signed) → Run workflow**. Each run uses the run number as
-build number, so TestFlight never rejects a duplicate. After the upload finishes, the build
-shows up under *TestFlight* in App Store Connect within about 5–15 minutes. Add yourself
-as an internal tester and install it with the TestFlight app.
+Each run's summary page shows the bundle ID, team and build number. The first step also
+checks the key and explains 401/403 errors before the slow build starts.
 
 ## Project layout
 

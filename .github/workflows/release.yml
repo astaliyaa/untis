@@ -1,39 +1,51 @@
-name: Release (signed)
+name: Release (TestFlight)
 
-# Signs the app with your Apple Developer certificate + provisioning profile
-# (stored as repository secrets) and
-#   * always attaches the signed .ipa as a workflow artifact
-#   * uploads it to TestFlight when the profile is an App Store profile and
-#     the App Store Connect API key secrets are present.
+# Builds the app and ships it to TestFlight using only an App Store Connect API
+# key – no certificate or provisioning profile files. The archive is built
+# unsigned and ad-hoc signed; `xcodebuild -exportArchive` then signs it with a
+# cloud-managed Apple Distribution certificate (needs an *Admin* API key).
 #
-# Required secrets  : BUILD_CERTIFICATE_BASE64, P12_PASSWORD, BUILD_PROVISION_PROFILE_BASE64
-# For TestFlight    : ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8
-# Optional secret   : KEYCHAIN_PASSWORD (random if missing)
-# Optional variables: BUNDLE_ID (only needed for wildcard profiles), XCODE_VERSION
-# See README.md for how to create each one.
+# Repository secrets used:
+#   APPLE_TEAM_ID   10-character Team ID (developer.apple.com → Membership)
+#   ASC_KEY_ID      App Store Connect API key ID
+#   ASC_ISSUER_ID   Issuer ID shown above the key list
+#   ASC_KEY_P8      contents of AuthKey_<KEY_ID>.p8 (as-is, or base64)
+# Optional repository variable:
+#   BUNDLE_ID       defaults to com.<repo owner>.timetablestudio
 
 on:
   workflow_dispatch:
     inputs:
       upload_to_testflight:
-        description: Upload to TestFlight (App Store profile + ASC_* secrets needed)
+        description: Upload to TestFlight (off = only build the signed IPA artifact)
         type: boolean
         default: true
       marketing_version:
-        description: Version shown in TestFlight (leave empty to keep 1.0.0)
+        description: Version shown in TestFlight (empty = 1.0.0)
         type: string
         default: ""
   push:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
-    name: Archive, sign & ship
+    name: Build, sign & upload
     runs-on: macos-26
     timeout-minutes: 60
     env:
       SCHEME: TimetableStudio
+      APP_NAME: Timetable Studio
+      BUNDLE_ID: ${{ vars.BUNDLE_ID || format('com.{0}.timetablestudio', github.repository_owner) }}
+      BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+      UPLOAD: ${{ github.event_name == 'push' || inputs.upload_to_testflight }}
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
     steps:
@@ -48,117 +60,66 @@ jobs:
           fi
           xcodebuild -version
 
-      - name: Check secrets
+      - name: Check secrets & write API key
         env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
+          set -euo pipefail
           missing=""
-          [ -n "$BUILD_CERTIFICATE_BASE64" ] || missing="$missing BUILD_CERTIFICATE_BASE64"
-          [ -n "$BUILD_PROVISION_PROFILE_BASE64" ] || missing="$missing BUILD_PROVISION_PROFILE_BASE64"
+          for name in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
           if [ -n "$missing" ]; then
-            echo "::error::Missing repository secrets:$missing (Settings → Secrets and variables → Actions). See README.md."
+            echo "::error::Missing repository secrets:$missing (Settings → Secrets and variables → Actions)."
             exit 1
           fi
+          TEAM_ID=$(printf '%s' "$APPLE_TEAM_ID" | tr -d '[:space:]')
+          KEY_ID=$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]')
+          ISSUER_ID=$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]')
+          if ! printf '%s' "$TEAM_ID" | grep -Eq '^[A-Z0-9]{10}$'; then
+            echo "::error::APPLE_TEAM_ID should be the 10-character Team ID (e.g. AB12CD34EF), found ${#TEAM_ID} characters."
+            exit 1
+          fi
+
+          KEY_DIR="$RUNNER_TEMP/asc"
+          mkdir -p "$KEY_DIR"
+          KEY_FILE="$KEY_DIR/AuthKey_$KEY_ID.p8"
+          if printf '%s' "$ASC_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s\n' "$ASC_KEY_P8" > "$KEY_FILE"
+          else
+            printf '%s' "$ASC_KEY_P8" | tr -d '\r\n ' | base64 --decode > "$KEY_FILE"
+          fi
+          chmod 600 "$KEY_FILE"
+          if ! openssl pkey -in "$KEY_FILE" -noout 2>/dev/null; then
+            echo "::error::ASC_KEY_P8 is not a valid private key. Paste the whole .p8 file including the BEGIN/END PRIVATE KEY lines."
+            exit 1
+          fi
+
+          {
+            echo "TEAM_ID=$TEAM_ID"
+            echo "KEY_ID=$KEY_ID"
+            echo "ISSUER_ID=$ISSUER_ID"
+            echo "KEY_FILE=$KEY_FILE"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### Release"
+            echo "- Bundle ID: \`$BUNDLE_ID\` · Team: \`$TEAM_ID\` · Build: \`$BUILD_NUMBER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check API key, App ID & App Store Connect app
+        run: ruby scripts/asc_preflight.rb "$KEY_FILE" "$KEY_ID" "$ISSUER_ID" "$BUNDLE_ID" "$APP_NAME" "$UPLOAD"
 
       - name: Generate Xcode project
         run: |
           brew install xcodegen
           xcodegen generate
 
-      - name: Install certificate & provisioning profile
-        id: signing
+      - name: Archive (unsigned)
         env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          BUNDLE_ID_OVERRIDE: ${{ vars.BUNDLE_ID }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-$(openssl rand -base64 24)}"
-          CERT="$RUNNER_TEMP/certificate.p12"
-          PROFILE="$RUNNER_TEMP/profile.mobileprovision"
-          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
-          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
-          PB=/usr/libexec/PlistBuddy
-
-          printf '%s' "$BUILD_CERTIFICATE_BASE64" | tr -d '\r\n ' | base64 --decode > "$CERT"
-          printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | tr -d '\r\n ' | base64 --decode > "$PROFILE"
-
-          # Temporary keychain with the signing identity
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$CERT" -P "${P12_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          # Apple intermediate certificate (harmless if already installed)
-          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$RUNNER_TEMP/wwdr.cer" \
-            && security import "$RUNNER_TEMP/wwdr.cer" -k "$KEYCHAIN" >/dev/null 2>&1 || true
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-
-          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/"/ { print $2; exit }')
-          if [ -z "$IDENTITY" ]; then
-            echo "::error::No valid signing identity in the .p12 – export the certificate *together with its private key*."
-            exit 1
-          fi
-
-          # Read everything we need from the provisioning profile
-          security cms -D -i "$PROFILE" > "$PROFILE_PLIST"
-          UUID=$($PB -c 'Print :UUID' "$PROFILE_PLIST")
-          NAME=$($PB -c 'Print :Name' "$PROFILE_PLIST")
-          TEAM_ID=$($PB -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
-          APP_ID=$($PB -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")
-          PROFILE_BUNDLE_ID="${APP_ID#*.}"
-
-          BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-}"
-          if [ -z "$BUNDLE_ID" ]; then
-            case "$PROFILE_BUNDLE_ID" in
-              *'*'*) echo "::error::'$NAME' is a wildcard profile – set the repository variable BUNDLE_ID."; exit 1 ;;
-              *) BUNDLE_ID="$PROFILE_BUNDLE_ID" ;;
-            esac
-          fi
-
-          if $PB -c 'Print :ProvisionsAllDevices' "$PROFILE_PLIST" >/dev/null 2>&1; then
-            METHOD=enterprise
-          elif $PB -c 'Print :ProvisionedDevices' "$PROFILE_PLIST" >/dev/null 2>&1; then
-            if [ "$($PB -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || echo false)" = "true" ]; then
-              METHOD=debugging
-            else
-              METHOD=release-testing
-            fi
-          else
-            METHOD=app-store-connect
-          fi
-
-          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            mkdir -p "$dir"
-            cp "$PROFILE" "$dir/$UUID.mobileprovision"
-          done
-
-          {
-            echo "identity=$IDENTITY"
-            echo "profile_uuid=$UUID"
-            echo "profile_name=$NAME"
-            echo "team_id=$TEAM_ID"
-            echo "bundle_id=$BUNDLE_ID"
-            echo "method=$METHOD"
-            echo "keychain=$KEYCHAIN"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "### Signing" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Identity: \`$IDENTITY\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Profile: \`$NAME\` → export method \`$METHOD\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Bundle ID: \`$BUNDLE_ID\` · Team: \`$TEAM_ID\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Archive
-        env:
-          IDENTITY: ${{ steps.signing.outputs.identity }}
-          PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
-          TEAM_ID: ${{ steps.signing.outputs.team_id }}
-          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
-          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
-          BUILD_NUMBER: ${{ github.run_number }}
           MARKETING_VERSION_INPUT: ${{ inputs.marketing_version }}
         run: |
           set -euo pipefail
@@ -172,96 +133,68 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
-            CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGN_IDENTITY="$IDENTITY" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             ${EXTRA[@]+"${EXTRA[@]}"} \
             -quiet \
             archive
 
-      - name: Export signed IPA
-        env:
-          IDENTITY: ${{ steps.signing.outputs.identity }}
-          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
-          TEAM_ID: ${{ steps.signing.outputs.team_id }}
-          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
-          METHOD: ${{ steps.signing.outputs.method }}
+      - name: Ad-hoc sign archive
+        run: sh scripts/adhoc_sign_archive.sh "$RUNNER_TEMP/$SCHEME.xcarchive" "$TEAM_ID" "$BUNDLE_ID"
+
+      - name: Export signed IPA (cloud signing)
         run: |
           set -euo pipefail
           make_options() {
             local plist="$1" destination="$2"
             rm -f "$plist"
             plutil -create xml1 "$plist"
-            plutil -insert method -string "$METHOD" "$plist"
+            plutil -insert method -string app-store-connect "$plist"
             plutil -insert teamID -string "$TEAM_ID" "$plist"
-            plutil -insert signingStyle -string manual "$plist"
-            plutil -insert signingCertificate -string "$IDENTITY" "$plist"
-            plutil -insert provisioningProfiles -json "{\"$BUNDLE_ID\":\"$PROFILE_UUID\"}" "$plist"
-            plutil -insert manageAppVersionAndBuildNumber -bool NO "$plist"
+            plutil -insert signingStyle -string automatic "$plist"
             plutil -insert destination -string "$destination" "$plist"
-            if [ "$METHOD" = "app-store-connect" ]; then
-              plutil -insert uploadSymbols -bool YES "$plist"
-            fi
+            plutil -insert uploadSymbols -bool YES "$plist"
+            plutil -insert manageAppVersionAndBuildNumber -bool NO "$plist"
           }
           make_options "$RUNNER_TEMP/ExportOptions.plist" export
           make_options "$RUNNER_TEMP/UploadOptions.plist" upload
+
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_FILE" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID"
           IPA=$(find "$RUNNER_TEMP/export" -name '*.ipa' | head -n 1)
-          cp "$IPA" "$SCHEME.ipa"
-          ls -lh "$SCHEME.ipa"
+          cp "$IPA" "$SCHEME-$BUILD_NUMBER.ipa"
+          ls -lh "$SCHEME-$BUILD_NUMBER.ipa"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.SCHEME }}-signed-ipa
-          path: ${{ env.SCHEME }}.ipa
+          name: ${{ env.SCHEME }}-appstore-ipa
+          path: ${{ env.SCHEME }}-*.ipa
           retention-days: 30
 
       - name: Upload to TestFlight
-        if: steps.signing.outputs.method == 'app-store-connect' && (github.event_name == 'push' || inputs.upload_to_testflight)
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        if: env.UPLOAD == 'true'
         run: |
           set -euo pipefail
-          if [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ] || [ -z "$ASC_KEY_P8" ]; then
-            echo "::warning::ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 not set – skipped TestFlight upload. The signed IPA is in the run's artifacts."
-            exit 0
-          fi
-          KEY_DIR="$HOME/.appstoreconnect/private_keys"
-          mkdir -p "$KEY_DIR"
-          KEY="$KEY_DIR/AuthKey_$ASC_KEY_ID.p8"
-          if printf '%s' "$ASC_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
-            printf '%s\n' "$ASC_KEY_P8" > "$KEY"
-          else
-            printf '%s' "$ASC_KEY_P8" | tr -d '\r\n ' | base64 --decode > "$KEY"
-          fi
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
             -exportPath "$RUNNER_TEMP/upload" \
             -exportOptionsPlist "$RUNNER_TEMP/UploadOptions.plist" \
             -allowProvisioningUpdates \
-            -authenticationKeyPath "$KEY" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
-          echo "Uploaded build ${{ github.run_number }} – it shows up in App Store Connect → TestFlight after processing (usually 5–15 min)." >> "$GITHUB_STEP_SUMMARY"
+            -authenticationKeyPath "$KEY_FILE" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID"
+          echo "- ✅ Uploaded build \`$BUILD_NUMBER\`. It appears in App Store Connect → TestFlight after processing (usually 5–15 min)." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Clean up signing material
+      - name: Remove API key
         if: always()
-        env:
-          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
-          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
-        run: |
-          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" || true
-          if [ -n "${PROFILE_UUID:-}" ]; then
-            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision" \
-                  "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-          fi
-          rm -rf "$HOME/.appstoreconnect" "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.mobileprovision || true
+        run: rm -rf "$RUNNER_TEMP/asc"
